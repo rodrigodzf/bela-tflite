@@ -1,0 +1,119 @@
+# ##################################################################################
+# Setup Nvidia CUDA for Bela
+# ##################################################################################
+FROM debian:bullseye as devel
+
+# Accept default answers for everything
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Fix CUDA info
+ARG DPKG_STATUS
+
+
+RUN echo "$DPKG_STATUS" >> /var/lib/dpkg/status \
+    && echo "[Builder] Installing Prerequisites" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends wget tar
+
+# Update environment
+RUN ln -fs /usr/share/zoneinfo/Europe/London /etc/localtime
+
+
+# ##################################################################################
+# Create Tensorflow Docker Layer
+# We do this seperately since else we need to keep rebuilding
+# ##################################################################################
+FROM debian:bullseye as downloader-tensorflow
+
+ARG V_TENSORFLOW=v2.5.0
+
+# Install Git Tools
+RUN apt update \
+    && apt install -y git \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt clean
+
+# Accept default answers for everything
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Clone Source
+RUN git clone --recursive --branch ${V_TENSORFLOW} https://github.com/tensorflow/tensorflow
+
+# ##################################################################################
+# Build Tensorflow for Jetson (with CUDA)
+# ##################################################################################
+FROM devel as builder
+
+# Accept default answers for everything
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Download Common Software
+RUN apt update \
+    && apt install -y \
+    libatomic1 \
+    ninja-build \
+    cmake \
+    ccache
+
+# ##################################################################################
+# Download patched gcc
+# ##################################################################################
+RUN wget --no-check-certificate "https://downloads.sourceforge.net/project/raspberry-pi-cross-compilers/Raspberry%20Pi%20GCC%20Cross-Compiler%20Toolchains/Bullseye/GCC%2010.3.0/Raspberry%20Pi%202%2C%203/cross-gcc-10.3.0-pi_2-3.tar.gz"
+
+
+RUN tar -xf cross-gcc-10.3.0-pi_2-3.tar.gz --directory /opt/
+
+# Setting up Python 3.9
+WORKDIR /install
+
+# RUN apt-get install gcc-multilib
+RUN apt install -y build-essential gawk gcc g++ gfortran git texinfo bison libncurses-dev
+
+# RUN apt-get update \
+#     && apt-get install -y curl python${V_PYTHON} python${V_PYTHON}-dev python${V_PYTHON}-distutils python${V_PYTHON_MAJOR}-dev \
+#     && ln -s $(which python${V_PYTHON}) /usr/bin/python \
+#     && curl --silent --show-error https://bootstrap.pypa.io/get-pip.py | python \
+#     && pip3 install setuptools==59.5.0 
+    # && ln -s $(which python${V_PYTHON}) /usr/bin/python${V_PYTHON_MAJOR} \
+
+    # && rm /usr/bin/python \
+    # && rm /usr/bin/python${V_PYTHON_MAJOR} \
+
+# Tensorflow - Build - Source Code Setup 
+# copy everything from the downloader-tensorflow layer /torch to /torch on this one
+COPY --from=downloader-tensorflow /tensorflow /tensorflow
+WORKDIR /tensorflow
+
+# Build - Prerequisites
+# Set clang as compiler
+# clang supports the ARM NEON registers
+# GNU GCC will give "no expression error"
+ARG ARMCC_PREFIX=/opt/cross-pi-gcc-10.3.0-1
+ARG ARMCC_FLAGS="-march=armv7-a -mtune=cortex-a8 -mfloat-abi=hard -mfpu=neon -mfp16-format=ieee -Wno-error=format"
+
+# Set path to ccache
+ARG PATH=/usr/lib/ccache:${ARMCC_PREFIX}/bin:$PATH
+ARG LD_LIBRARY_PATH=${ARMCC_PREFIX}/lib:$LD_LIBRARY_PATH
+ARG ARCH=x86
+
+RUN cmake . -B build -GNinja \
+  -DCMAKE_C_COMPILER=${ARMCC_PREFIX}/bin/arm-linux-gnueabihf-gcc \
+  -DCMAKE_CXX_COMPILER=${ARMCC_PREFIX}/bin/arm-linux-gnueabihf-g++ \
+  -DCMAKE_C_FLAGS="${ARMCC_FLAGS}" \
+  -DCMAKE_CXX_FLAGS="${ARMCC_FLAGS}" \
+  -DCMAKE_VERBOSE_MAKEFILE=ON \
+  -DCMAKE_SYSTEM_NAME=Linux \
+  -DCMAKE_SYSTEM_PROCESSOR=armv7 \
+  -DTFLITE_ENABLE_XNNPACK=ON \
+  -DCMAKE_INSTALL_PREFIX:PATH=tensorflow-install \
+  tensorflow/lite
+
+
+RUN cmake --build build --target install
+RUN tar -cpzf tensorflow-install.tar.gz build/ tensorflow/lite/
+
+# ##################################################################################
+# Prepare Artifact
+# ##################################################################################
+FROM scratch as artifact
+COPY --from=builder /tensorflow/tensorflow-install.tar.gz /
